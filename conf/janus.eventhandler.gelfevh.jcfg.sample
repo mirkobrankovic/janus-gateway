@@ -12,6 +12,6 @@ general: {
 	json = "indented"	# Whether the JSON messages should be indented (default),
 						# plain (no indentation) or compact (no indentation and no spaces)
 
-	backend = "your.webserver.here"
+	backend = "your.gelfserver.here"
 	port = "12201"
 }

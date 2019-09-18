@@ -21,14 +21,16 @@
 #include "../mutex.h"
 #include "../utils.h"
 #include "../events.h"
+#include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include "../ip-utils.h"
 
 /* Plugin information */
 #define JANUS_GELFEVH_VERSION			1
 #define JANUS_GELFEVH_VERSION_STRING 	"0.0.1"
-#define JANUS_GELFEVH_DESCRIPTION 		"This is a trivial sample event handler plugin for Janus, which forwards events via HTTP POST."
+#define JANUS_GELFEVH_DESCRIPTION 		"This is a simple event handler plugin for Janus, which forwards events via UDP to GELF server."
 #define JANUS_GELFEVH_NAME 				"JANUS GelfEventHandler plugin"
 #define JANUS_GELFEVH_AUTHOR 			"Meetecho s.r.l."
 #define JANUS_GELFEVH_PACKAGE			"janus.eventhandler.gelfevh"
@@ -95,6 +97,7 @@ static void janus_gelfevh_event_free(json_t *event) {
 /* Gelf backend to send the events to */
 static char *backend = NULL;
 static char *port = NULL;
+static int sockfd;
 
 /* Parameter validation (for tweaking via Admin API) */
 static struct janus_json_parameter request_parameters[] = {
@@ -112,6 +115,52 @@ static struct janus_json_parameter tweak_parameters[] = {
 #define JANUS_GELFEVH_ERROR_UNKNOWN_ERROR 		499
 
 /* Plugin implementation */
+
+static void janus_gelfevh_connect(void) {
+	struct sockaddr_in servaddr;
+	struct addrinfo *res = NULL;
+	janus_network_address addr;
+	janus_network_address_string_buffer addr_buf;
+
+	if (getaddrinfo(backend, NULL, NULL, &res) != 0 ||
+		janus_network_address_from_sockaddr(res->ai_addr, &addr) != 0 ||
+		janus_network_address_to_string_buffer(&addr, &addr_buf) != 0) {
+		if (res)
+			freeaddrinfo(res);
+		JANUS_LOG(LOG_ERR, "Could not resolve address (%s)...\n", backend);
+		return;
+	}
+	const char *host = g_strdup(janus_network_address_string_from_buffer(&addr_buf));
+	freeaddrinfo(res);
+
+	bzero(&servaddr, sizeof(servaddr));
+	servaddr.sin_addr.s_addr = inet_addr(host);
+	servaddr.sin_port = htons(atoi(port));
+	servaddr.sin_family = AF_INET;
+	memset(servaddr.sin_zero, '\0', sizeof(servaddr.sin_zero));
+
+	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+
+	// connect to server
+	if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+		JANUS_LOG(LOG_WARN, "Connect to Gelf host failed\n");
+		return;
+	}
+	JANUS_LOG(LOG_INFO, "Connected to GELF backend: [%s:%s]\n", host, port);
+}
+
+static void janus_gelfevh_send(char *message) {
+	if(!message) {
+		JANUS_LOG(LOG_WARN, "Message is NULL, not sending to Gelf!\n");
+		return;
+	}
+	//send message
+	if (write(sockfd, message, 8192) == -1) {
+		JANUS_LOG(LOG_WARN, "Send to Gelf host failed, reconnect ... ?\n");
+	}
+	return;
+}
+
 int janus_gelfevh_init(const char *config_path) {
 	if(g_atomic_int_get(&stopping)) {
 		/* Still stopping from before */
@@ -210,6 +259,7 @@ done:
 		return -1;
 	}
 	JANUS_LOG(LOG_INFO, "%s initialized!\n", JANUS_GELFEVH_NAME);
+	janus_gelfevh_connect();
 	return 0;
 }
 
@@ -231,6 +281,9 @@ void janus_gelfevh_destroy(void) {
 
 	g_atomic_int_set(&initialized, 0);
 	g_atomic_int_set(&stopping, 0);
+	
+	close(sockfd);
+
 	JANUS_LOG(LOG_INFO, "%s destroyed!\n", JANUS_GELFEVH_NAME);
 }
 
@@ -352,38 +405,6 @@ plugin_response:
 		}
 }
 
-static void janus_gelfevh_send(char *message)
-{
-	int sockfd;
-	struct sockaddr_in servaddr;
-
-	bzero(&servaddr, sizeof(servaddr));
-	servaddr.sin_addr.s_addr = inet_addr(backend);
-	servaddr.sin_port = htons(atoi(port));
-	servaddr.sin_family = AF_INET;
-	memset(servaddr.sin_zero, '\0', sizeof(servaddr.sin_zero));
-
-	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-
-	//JANUS_LOG(LOG_WARN, "Event: '%s'\n", message);
-
-	// connect to server
-	if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
-	{
-		JANUS_LOG(LOG_WARN, "Connect failed\n");
-		return;
-	}
-
-	if (write(sockfd, message, 2000) == -1)
-	{
-		JANUS_LOG(LOG_WARN, "Send failed\n");
-		return;
-	}
-	// close the descriptor
-	close(sockfd);
-	return;
-}
-
 /* Thread to handle incoming events */
 static void *janus_gelfevh_handler(void *data) {
 	JANUS_LOG(LOG_VERB, "Joining GelfEventHandler handler thread\n");
@@ -432,10 +453,7 @@ static void *janus_gelfevh_handler(void *data) {
 			/* Since this a simple plugin, it does the same for all events: so just convert to string... */
 			event_text = json_dumps(event, json_format);
 		}
-		//JANUS_LOG(LOG_WARN, "event: '%s'\n", event_text);
 		janus_gelfevh_send(event_text);
-		//done:
-		/* Cleanup */
 		/* Done, let's unref the event */
 		json_decref(event);
 		event = NULL;
