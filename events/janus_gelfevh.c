@@ -35,6 +35,10 @@
 #define JANUS_GELFEVH_AUTHOR 			"Meetecho s.r.l."
 #define JANUS_GELFEVH_PACKAGE			"janus.eventhandler.gelfevh"
 
+/* GELF UDP datagram helpers http://docs.graylog.org/en/2.5/pages/gelf.html#gelf-via-udp */
+#define MAX_GELF_DATAGRAM_LEN 8192
+#define MAGIC_LEN 2
+
 /* Plugin methods */
 janus_eventhandler *create(void);
 int janus_gelfevh_init(const char *config_path);
@@ -98,6 +102,7 @@ static void janus_gelfevh_event_free(json_t *event) {
 static char *backend = NULL;
 static char *port = NULL;
 static int sockfd;
+static struct sockaddr_in servaddr;
 
 /* Parameter validation (for tweaking via Admin API) */
 static struct janus_json_parameter request_parameters[] = {
@@ -115,9 +120,7 @@ static struct janus_json_parameter tweak_parameters[] = {
 #define JANUS_GELFEVH_ERROR_UNKNOWN_ERROR 		499
 
 /* Plugin implementation */
-
 static void janus_gelfevh_connect(void) {
-	struct sockaddr_in servaddr;
 	struct addrinfo *res = NULL;
 	janus_network_address addr;
 	janus_network_address_string_buffer addr_buf;
@@ -150,15 +153,15 @@ static void janus_gelfevh_connect(void) {
 }
 
 static void janus_gelfevh_send(char *message) {
-	if(!message) {
-		JANUS_LOG(LOG_WARN, "Message is NULL, not sending to Gelf!\n");
+		if (!message) {
+			JANUS_LOG(LOG_WARN, "Message is NULL, not sending to Gelf!\n");
+			return;
+		}
+		if (sendto(sockfd, message, strlen(message), 0, &servaddr, sizeof(servaddr)) < 0) {
+			JANUS_LOG(LOG_WARN, "Send to Gelf host failed, reconnect ... ?\n");
+			close(sockfd);
+		}
 		return;
-	}
-	//send message
-	if (write(sockfd, message, 8192) == -1) {
-		JANUS_LOG(LOG_WARN, "Send to Gelf host failed, reconnect ... ?\n");
-	}
-	return;
 }
 
 int janus_gelfevh_init(const char *config_path) {
@@ -211,27 +214,8 @@ int janus_gelfevh_init(const char *config_path) {
 		item = janus_config_get(config, config_general, janus_config_type_item, "events");
 		if (item && item->value)
 			janus_events_edit_events_mask(item->value, &janus_gelfevh.events_mask);
-		/* Check the JSON indentation */
-		item = janus_config_get(config, config_general, janus_config_type_item, "json");
-		if (item && item->value) {
-			/* Check how we need to format/serialize the JSON output */
-			if (!strcasecmp(item->value, "indented")) {
-				/* Default: indented, we use three spaces for that */
-				json_format = JSON_INDENT(3) | JSON_PRESERVE_ORDER;
-			}
-			else if (!strcasecmp(item->value, "plain")) {
-				/* Not indented and no new lines, but still readable */
-				json_format = JSON_INDENT(0) | JSON_PRESERVE_ORDER;
-			}
-			else if (!strcasecmp(item->value, "compact")) {
-				/* Compact, so no spaces between separators */
-				json_format = JSON_COMPACT | JSON_PRESERVE_ORDER;
-			}
-			else {
-				JANUS_LOG(LOG_WARN, "Unsupported JSON format option '%s', using default (indented)\n", item->value);
-				json_format = JSON_INDENT(3) | JSON_PRESERVE_ORDER;
-			}
-		}
+		/* Compact, so no spaces between separators */
+		json_format = JSON_COMPACT | JSON_PRESERVE_ORDER;
 		/* Done */
 		enabled = TRUE;
 	}
@@ -410,6 +394,10 @@ static void *janus_gelfevh_handler(void *data) {
 	JANUS_LOG(LOG_VERB, "Joining GelfEventHandler handler thread\n");
 	json_t *event = NULL;
 	static char *event_text = NULL;
+
+	//int session_id = json_integer_value(json_object_get(event, "session_id"));
+	//int handle_id = json_integer_value(json_object_get(event, "handle_id"));
+
 	while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
 		event = g_async_queue_pop(events);
 		if(event == NULL)
@@ -417,13 +405,7 @@ static void *janus_gelfevh_handler(void *data) {
 		if(event == &exit_event)
 			break;
 		while(TRUE) {
-			/* Handle event: just for fun, let's see how long it took for us to take care of this */
-			json_t *created = json_object_get(event, "timestamp");
-			if(created && json_is_integer(created)) {
-				gint64 then = json_integer_value(created);
-				gint64 now = janus_get_monotonic_time();
-				JANUS_LOG(LOG_DBG, "Handled event after %"SCNu64" us, now: %"SCNu64", then: %"SCNu64"\n", now - then, now, then);
-			}
+			/* Handle event */
 			int type = json_integer_value(json_object_get(event, "type"));
 			switch(type) {
 				case JANUS_EVENT_TYPE_SESSION:
@@ -450,7 +432,12 @@ static void *janus_gelfevh_handler(void *data) {
 			event = g_async_queue_try_pop(events);
 			if(event == NULL || event == &exit_event)
 				break;
-			/* Since this a simple plugin, it does the same for all events: so just convert to string... */
+			json_object_set_new(event, "version", json_string("1.1"));
+			json_object_set_new(event, "host", json_string("janus"));
+			json_object_set_new(event, "level", json_integer(1));
+			json_object_set_new(event, "short_message", json_string("short_message"));
+			json_object_set_new(event, "full_message", json_string("full_message"));
+			/* Just convert to string... */
 			event_text = json_dumps(event, json_format);
 		}
 		janus_gelfevh_send(event_text);
@@ -458,6 +445,6 @@ static void *janus_gelfevh_handler(void *data) {
 		json_decref(event);
 		event = NULL;
 	}
-	JANUS_LOG(LOG_VERB, "Leaving GelfEventHandler handler thread\n");
+	JANUS_LOG(LOG_VERB, "Leaving Gelf Event handler thread\n");
 	return NULL;
 }
