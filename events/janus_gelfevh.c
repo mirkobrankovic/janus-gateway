@@ -36,6 +36,8 @@
 #define JANUS_GELFEVH_AUTHOR 			"Meetecho s.r.l."
 #define JANUS_GELFEVH_PACKAGE			"janus.eventhandler.gelfevh"
 
+#define MAX_GELF_LOG_LEN 8192
+
 /* Plugin methods */
 janus_eventhandler *create(void);
 int janus_gelfevh_init(const char *config_path);
@@ -99,7 +101,7 @@ static void janus_gelfevh_event_free(json_t *event) {
 static char *backend = NULL;
 static char *port = NULL;
 static int sockfd;
-static struct sockaddr_in servaddr;
+//static struct sockaddr_in servaddr;
 
 /* Parameter validation (for tweaking via Admin API) */
 static struct janus_json_parameter request_parameters[] = {
@@ -123,10 +125,10 @@ static void janus_gelfevh_connect(void) {
 	janus_network_address_string_buffer addr_buf;
 	struct sockaddr_in servaddr;
 
-	if (getaddrinfo(backend, NULL, NULL, &res) != 0 ||
+	if(getaddrinfo(backend, NULL, NULL, &res) != 0 ||
 		janus_network_address_from_sockaddr(res->ai_addr, &addr) != 0 ||
 		janus_network_address_to_string_buffer(&addr, &addr_buf) != 0) {
-		if (res)
+		if(res)
 			freeaddrinfo(res);
 		JANUS_LOG(LOG_ERR, "Could not resolve address (%s)...\n", backend);
 		return;
@@ -134,7 +136,7 @@ static void janus_gelfevh_connect(void) {
 	const char *host = g_strdup(janus_network_address_string_from_buffer(&addr_buf));
 	freeaddrinfo(res);
 
-    if ( (sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0 ) {
+    if((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0 ) {
 		JANUS_LOG(LOG_ERR, "Socket creation failed");
 		return;
 	}
@@ -145,29 +147,24 @@ static void janus_gelfevh_connect(void) {
 	servaddr.sin_port = htons(atoi(port));
 	servaddr.sin_addr.s_addr = inet_addr(host);
 
-	if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+	if(connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
 		JANUS_LOG(LOG_WARN, "Connect to Gelf host failed\n");
 		return;
 	}
 	JANUS_LOG(LOG_INFO, "Connected to GELF backend: [%s:%s]\n", host, port);
 }
 
-static void janus_gelfevh_send(char *message) {
-		if (!message) {
-			JANUS_LOG(LOG_WARN, "Message is NULL, not sending to Gelf!\n");
-			return;
-		}
-
-		if (sendto(sockfd, message, strlen(message),
-			   MSG_CONFIRM, (const struct sockaddr *)&servaddr,
-			   sizeof(servaddr)) < 0) {
-		//if (sendto(sockfd, message, strlen(message), 0, &servaddr, sizeof(servaddr)) < 0) {
-		//sizeof(message) < 0
-		//if (write(sockfd, message, 8192) < 0) {
-			JANUS_LOG(LOG_WARN, "Send to Gelf host failed, reconnect ... ?\n");
-			close(sockfd);
-		}
-		return;
+static int janus_gelfevh_send(char *message) {
+	//JANUS_LOG(LOG_WARN, "Sending event to GELF: %s\n", message);
+	if(!message) {
+		JANUS_LOG(LOG_WARN, "Message is NULL, not sending to Gelf!\n");
+		return -1;
+	}
+	if (write(sockfd, message, MAX_GELF_LOG_LEN) < 0) {
+		//close(sockfd);
+		return -1;
+	}
+	return 1;
 }
 
 int janus_gelfevh_init(const char *config_path) {
@@ -205,7 +202,7 @@ int janus_gelfevh_init(const char *config_path) {
 			goto done;
 		}
 		item_backend = janus_config_get(config, config_general, janus_config_type_item, "backend");
-		if (!item_backend || !item_backend->value) {
+		if(!item_backend || !item_backend->value) {
 			JANUS_LOG(LOG_WARN, "Missing or invalid backend\n");
 			goto done;
 		}
@@ -218,7 +215,7 @@ int janus_gelfevh_init(const char *config_path) {
 		port = g_strdup(item_port->value);
 		/* Which events should we subscribe to? */
 		item = janus_config_get(config, config_general, janus_config_type_item, "events");
-		if (item && item->value)
+		if(item && item->value)
 			janus_events_edit_events_mask(item->value, &janus_gelfevh.events_mask);
 		/* Compact, so no spaces between separators */
 		json_format = JSON_COMPACT | JSON_PRESERVE_ORDER;
@@ -320,6 +317,7 @@ void janus_gelfevh_incoming_event(json_t *event) {
 	 * when the event actually happened on this machine, so that, if relevant, we can compute
 	 * any delay in the actual event processing ourselves. */
 	json_incref(event);
+	//JANUS_LOG(LOG_WARN, "Got event: %s\n", json_dumps(event, json_format));
 	g_async_queue_push(events, event);
 
 }
@@ -353,7 +351,7 @@ json_t *janus_gelfevh_handle_request(json_t *request) {
 		/* Backend stuff */
 		if(json_object_get(request, "backend"))
 			req_backend = json_string_value(json_object_get(request, "backend"));
-		if (json_object_get(request, "port"))
+		if(json_object_get(request, "port"))
 			req_port = json_string_value(json_object_get(request, "port"));
 		if(req_backend && req_port) {
 			/* Invalid backend address, port */
@@ -398,19 +396,18 @@ plugin_response:
 /* Thread to handle incoming events */
 static void *janus_gelfevh_handler(void *data) {
 	JANUS_LOG(LOG_VERB, "Joining GelfEventHandler handler thread\n");
-	json_t *event = NULL;
+	json_t *event = NULL, *output = NULL;
 	static char *event_text = NULL;
 	const char *short_message = NULL;
 
-		//int session_id = json_integer_value(json_object_get(event, "session_id"));
-		//int handle_id = json_integer_value(json_object_get(event, "handle_id"));
-
-		while (g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
+	while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
 		event = g_async_queue_pop(events);
 		if(event == NULL)
 			continue;
 		if(event == &exit_event)
 			break;
+		output = NULL;
+
 		while(TRUE) {
 			/* Handle event */
 			int type = json_integer_value(json_object_get(event, "type"));
@@ -437,43 +434,42 @@ static void *janus_gelfevh_handler(void *data) {
 					short_message = "JANUS_EVENT_TYPE_TRANSPORT";
 					break;
 				case JANUS_EVENT_TYPE_CORE:
-					short_message = "JANUS_EVENT_TYPE_CORE";
-					break;
 				case JANUS_EVENT_TYPE_EXTERNAL:
-					short_message = "JANUS_EVENT_TYPE_EXTERNAL";
+					short_message = "JANUS_EVENT_TYPE_CORE";
 					break;
 				default:
 					JANUS_LOG(LOG_WARN, "Unknown type of event '%d'\n", type);
 					short_message = "UNKNOWN_JANUS_EVENT";
 					break;
 			}
-			event = g_async_queue_try_pop(events);
-			if(event == NULL || event == &exit_event)
-				break;
-
+			output = event;
+			/* Add custom fields */
 			json_t *microtimestamp = json_object_get(event, "timestamp");
 			if(microtimestamp && json_is_integer(microtimestamp)) {
 				double created_timestamp = (double)json_integer_value(microtimestamp) / 1000000;
-				json_object_set(event, "timestamp", json_real(created_timestamp));
-			} else {
+				json_object_set(output, "timestamp", json_real(created_timestamp));
+			}
+			else {
 				struct timeval t;
 				gettimeofday(&t, NULL);
 				double micro_timestamp = (double)(1000000 * t.tv_sec + t.tv_usec) / 1000000;
-				json_object_set(event, "timestamp", json_real(micro_timestamp));
+				json_object_set(output, "timestamp", json_real(micro_timestamp));
 			}
-			json_object_set(event, "version", json_string("1.1"));
-			json_object_set(event, "host", json_string("janus"));
-			json_object_set(event, "level", json_integer(1));
-			json_object_set(event, "short_message", json_string(short_message));
-			json_object_set(event, "full_message", json_object_get(event, "event"));
+			json_object_set(output, "version", json_string("1.1"));
+			json_object_set(output, "host", json_string("janus"));
+			json_object_set(output, "level", json_integer(1));
+			json_object_set(output, "short_message", json_string(short_message));
+			json_object_set(output, "full_message", json_object_get(event, "event"));
 			/* Just convert to string... */
-			event_text = json_dumps(event, json_format);
-			JANUS_LOG(LOG_WARN, "GELF event: %s\n", event_text);
+			event_text = json_dumps(output, json_format);
+			if(janus_gelfevh_send(event_text) < 0) {
+				JANUS_LOG(LOG_WARN, "Couldn't send event to GELF reconnect ... ?: %s\n", event_text);
+			}
+			break;
 		}
-		janus_gelfevh_send(event_text);
 		/* Done, let's unref the event */
-		json_decref(event);
-		event = NULL;
+		json_decref(output);
+		output = NULL;
 	}
 	JANUS_LOG(LOG_VERB, "Leaving Gelf Event handler thread\n");
 	return NULL;
